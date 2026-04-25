@@ -1,14 +1,19 @@
 import streamlit as st
+import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
-from nba_api.stats.static import teams
-from nba_api.stats.endpoints import LeagueDashTeamStats
+import requests
+from bs4 import BeautifulSoup
 
+from nba_api.stats.static import teams
+from nba_api.stats.endpoints import LeagueDashTeamStats, ScoreboardV2
+
+# ================= CONFIG =================
 st.set_page_config(page_title="AI Bet Pro", layout="wide")
 
 # ================= PWA =================
 st.markdown("""
 <link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#020617">
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/static/sw.js');
@@ -16,20 +21,16 @@ if ('serviceWorker' in navigator) {
 </script>
 """, unsafe_allow_html=True)
 
-# ================= UI =================
+# ================= STYLE =================
 st.markdown("""
 <style>
-.block-container {padding:0.6rem;}
 body {background: linear-gradient(135deg,#020617,#0f172a); color:white;}
-header, footer {visibility:hidden;}
-
 .card {
     background: rgba(255,255,255,0.05);
     padding:14px;
     border-radius:14px;
     margin-bottom:10px;
 }
-
 .stButton > button {
     width:100%;
     height:50px;
@@ -37,23 +38,8 @@ header, footer {visibility:hidden;}
     background:linear-gradient(90deg,#22c55e,#16a34a);
     color:white;
     font-size:16px;
-    font-weight:bold;
 }
-
-.bottom-bar {
-    position:fixed;
-    bottom:0;
-    left:0;
-    right:0;
-    background:#020617;
-    padding:10px;
-    border-top:1px solid rgba(255,255,255,0.1);
-}
-
-.spacer {height:80px;}
-
 .green {color:#22c55e;}
-.red {color:#ef4444;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,12 +48,13 @@ header, footer {visibility:hidden;}
 def get_teams():
     return teams.get_teams()
 
-@st.cache_data(ttl=3600)
-def get_all_ppg():
+@st.cache_data(ttl=1800)
+def get_team_stats(season):
     try:
         df = LeagueDashTeamStats(
+            season=season,
             per_mode_detailed="PerGame",
-            timeout=5
+            timeout=10
         ).get_data_frames()[0]
 
         return dict(zip(df["TEAM_ID"], df["PTS"]))
@@ -75,120 +62,139 @@ def get_all_ppg():
         return {}
 
 def get_ppg(team_id):
-    data = get_all_ppg()
+    stats = get_team_stats("2025-26")
+    return stats.get(team_id, 112)
 
-    if team_id in data:
-        return float(data[team_id])
+# ================= LIVE GAMES =================
+@st.cache_data(ttl=120)
+def get_live_games():
+    try:
+        today = pd.Timestamp.today().strftime("%Y-%m-%d")
+        sb = ScoreboardV2(game_date=today, day_offset=0)
+        df = sb.get_data_frames()[0]
 
-    # fallback values (safe)
-    fallback = {
-        1610612738: 117,
-        1610612737: 115,
-        1610612747: 113,
-        1610612744: 116,
-        1610612756: 114,
-    }
+        games = []
+        for _, row in df.iterrows():
+            home = str(row.get("HOME_TEAM_NAME",""))
+            away = str(row.get("VISITOR_TEAM_NAME",""))
+            if home and away:
+                games.append((home, away))
 
-    return fallback.get(team_id, 112)
+        if games:
+            return games
+    except:
+        pass
 
-def predict(h, a):
-    h += 2
+    return [
+        ("Boston Celtics","Miami Heat"),
+        ("Lakers","Warriors")
+    ]
+
+# ================= INJURY =================
+@st.cache_data(ttl=600)
+def get_injuries():
+    try:
+        url = "https://www.cbssports.com/nba/injuries/"
+        res = requests.get(url, timeout=8)
+        soup = BeautifulSoup(res.text,"html.parser")
+
+        names = []
+        for x in soup.select("tr"):
+            txt = x.get_text()
+            if "Out" in txt or "Questionable" in txt:
+                names.append(txt[:40])
+
+        return names[:10]
+    except:
+        return ["No major injuries"]
+
+# ================= AI =================
+def predict(home_ppg, away_ppg):
+    h = home_ppg + 2
+    a = away_ppg
     prob = (h/(h+a))*100
-    return round(prob,1), h, a
+    return round(prob,1), round(h), round(a)
 
-def calc_ev(prob, odds):
-    return (prob/100 * odds) - 1
+def explanation(home, away, h_ppg, a_ppg):
+    r = []
+    if h_ppg > a_ppg:
+        r.append(f"{home} mas mataas scoring")
+    else:
+        r.append(f"{away} mas mataas scoring")
+    r.append("May home advantage")
+    return r
 
-# ================= HEADER =================
-st.markdown('<div class="card"><b>🏀 AI BET PRO</b></div>', unsafe_allow_html=True)
+def star_player(ppg):
+    pts = round(ppg * 0.28,1)
+    mins = round(pts * 1.2)
+    return pts, mins
 
-# ================= NAV =================
-page = st.selectbox("Menu", ["Dashboard","Prediction","Autopilot","Portfolio"])
+# ================= UI =================
+st.title("🏀 AI BET PRO")
+
+page = st.selectbox("Menu",["Dashboard","Prediction","Live"])
 
 team_list = get_teams()
 names = [t["full_name"] for t in team_list]
 
 # ================= DASHBOARD =================
 if page == "Dashboard":
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Win Rate","62%")
-    c2.metric("ROI","+15%")
-    c3.metric("Bets","120")
+    st.markdown("### 📊 Overview")
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(y=[1,3,2,5,4],mode="lines+markers"))
-    fig.update_layout(template="plotly_dark")
-
+    fig.add_trace(go.Scatter(y=[1,2,3,2,5]))
     st.plotly_chart(fig,use_container_width=True)
 
 # ================= PREDICTION =================
 elif page == "Prediction":
-    home = st.selectbox("Home Team", names)
-    away = st.selectbox("Away Team", names)
 
-    if st.button("🚀 RUN AI"):
+    home = st.selectbox("Home",names)
+    away = st.selectbox("Away",names)
+
+    if st.button("RUN AI"):
+
         h_id = [t for t in team_list if t["full_name"]==home][0]["id"]
         a_id = [t for t in team_list if t["full_name"]==away][0]["id"]
 
         h_ppg = get_ppg(h_id)
         a_ppg = get_ppg(a_id)
 
-        prob,h,a = predict(h_ppg,a_ppg)
-        odds = 1.9
-        ev = calc_ev(prob,odds)
+        prob, hs, as_ = predict(h_ppg,a_ppg)
 
-        st.session_state.result = {
-            "match": f"{home} vs {away}",
-            "prob": prob,
-            "winner": home if h>a else away,
-            "odds": odds,
-            "ev": ev
-        }
+        reasons = explanation(home,away,h_ppg,a_ppg)
 
-    if "result" in st.session_state:
-        r = st.session_state.result
-        st.markdown(f"""
-        <div class="card">
-        <b>{r['match']}</b><br>
-        Winner: <span class="green">{r['winner']}</span><br>
-        Confidence: {r['prob']}%<br>
-        EV: {round(r['ev'],3)}
-        </div>
-        """, unsafe_allow_html=True)
-
-    stake = st.number_input("Stake", value=100)
-
-    st.markdown(f"""
-    <div class="bottom-bar">
-    💰 ₱{stake} → ₱{round(stake * 1.9,2)}
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown('<div class="spacer"></div>', unsafe_allow_html=True)
-
-# ================= AUTOPILOT =================
-elif page == "Autopilot":
-    st.markdown("### 🤖 Autopilot")
-
-    if "result" in st.session_state:
-        r = st.session_state.result
-
-        if r["prob"] > 65 and r["ev"] > 0:
-            st.success("✅ GOOD BET")
-        else:
-            st.warning("❌ SKIP")
-
-# ================= PORTFOLIO =================
-elif page == "Portfolio":
-    bankroll = st.number_input("Bankroll", value=5000)
-
-    if "result" in st.session_state:
-        r = st.session_state.result
-        stake = bankroll * 0.02
+        pts,mins = star_player(max(h_ppg,a_ppg))
 
         st.markdown(f"""
         <div class="card">
-        {r['match']}<br>
-        Stake: ₱{round(stake,2)}
+        <h3>{home} vs {away}</h3>
+
+        🏆 Winner: <span class="green">{home if hs>as_ else away}</span><br>
+        📊 Confidence: {prob}%<br>
+        🧮 Score: {hs} - {as_}
+
+        <br>
+        🔍 {"<br>".join(reasons)}
+
+        <br><br>
+        ⭐ Star Player:
+        {pts} pts | {mins} mins
         </div>
-        """, unsafe_allow_html=True)
+        """,unsafe_allow_html=True)
+
+# ================= LIVE =================
+elif page == "Live":
+
+    games = get_live_games()
+
+    for g in games:
+        st.markdown(f"""
+        <div class="card">
+        {g[0]} vs {g[1]}
+        </div>
+        """,unsafe_allow_html=True)
+
+# ================= INJURY =================
+st.sidebar.markdown("### 🏥 Injuries")
+for i in get_injuries():
+    st.sidebar.write("❌",i)
