@@ -1,4 +1,7 @@
 streamlit
-plotly
 pandas
+numpy
+plotly
+requests
+beautifulsoup4
 nba_api==1.4.1
