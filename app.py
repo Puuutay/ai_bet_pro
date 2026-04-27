@@ -1,209 +1,71 @@
 import streamlit as st
-import requests
 import pandas as pd
-import random
-from datetime import datetime, timedelta
-from sklearn.ensemble import RandomForestClassifier
+import requests
+from datetime import datetime
+from nba_api.stats.static import teams, players
+from nba_api.stats.endpoints import leaguegamefinder, playercareerstats, playergamelog
 
-st.set_page_config(page_title="Universal AI Master Oracle", layout="wide")
+# --- CONFIG (Palitan mo ng API Key mo o gamitin ang st.secrets) ---
+ODDS_API_KEY = '7ed79e37b1b4e6ce3ea728842b891341'
 
-ODDS_API_KEY = "YOUR_API_KEY_HERE"
+st.set_page_config(page_title="NBA AI Analytics", layout="wide")
+st.title("🏀 NBA Pro-Analytics & 1xBet Predictor")
 
-SPORT_MAP = {
-    "🏀 NBA": "basketball_nba",
-    "⚽ Soccer": "soccer_epl",
-    "⚾ MLB": "baseball_mlb"
-}
+tab1, tab2, tab3 = st.tabs(["Win/Loss & Fatigue", "Prop Predictor", "Player Stats"])
 
-# -----------------------------
-# FETCH ODDS
-# -----------------------------
-@st.cache_data(ttl=300)
-def fetch_odds(sport):
-    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "us",
-        "markets": "h2h",
-        "oddsFormat": "decimal"
-    }
+# --- FUNCTION PARA SA PAGOD (TRAVEL DISTANCE/B2B) ---
+def get_fatigue_penalty(team_id):
     try:
-        res = requests.get(url, params=params)
-        if res.status_code != 200:
-            return []
-        return res.json()
-    except:
-        return []
+        finder = leaguegamefinder.LeagueGameFinder(team_id_nullable=team_id)
+        games = finder.get_data_frames()
+        last_game_date = pd.to_datetime(games.iloc[0]['GAME_DATE'])
+        days_rest = (datetime.now() - last_game_date).days
+        penalty = 0
+        if days_rest <= 1: penalty -= 0.08  # Back-to-Back Penalty
+        if "@" in games.iloc[0]['MATCHUP']: penalty -= 0.04 # Away/Travel Penalty
+        return penalty
+    except: return 0
 
-# -----------------------------
-# TEAM STATS (REAL)
-# -----------------------------
-@st.cache_data(ttl=600)
-def compute_team_stats(team_name):
-    url = "https://www.balldontlie.io/api/v1/games"
-    try:
-        res = requests.get(url, params={"per_page": 50})
-        games = res.json()["data"]
+# --- TAB 1: WIN/LOSS ANALYTICS ---
+with tab1:
+    col1, col2 = st.columns(2)
+    all_teams = [t['full_name'] for t in teams.get_teams()]
+    with col1: home_team = st.selectbox("Home Team", all_teams)
+    with col2: away_team = st.selectbox("Away Team", all_teams)
 
-        pts, opp, count = 0, 0, 0
+    if st.button("Run AI Prediction"):
+        h_id = [t['id'] for t in teams.get_teams() if t['full_name'] == home_team][0]
+        a_id = [t['id'] for t in teams.get_teams() if t['full_name'] == away_team][0]
+        h_penalty = get_fatigue_penalty(h_id)
+        a_penalty = get_fatigue_penalty(a_id)
+        
+        final_prob = ( (0.55 + h_penalty) / ((0.55 + h_penalty) + (0.45 + a_penalty)) ) * 100
+        st.metric(label=f"Win Chance: {home_team}", value=f"{final_prob:.1f}%")
+        
+        # CHART: Win Probability
+        chart_data = pd.DataFrame({'Team': [home_team, away_team], 'Prob': [final_prob, 100-final_prob]})
+        st.bar_chart(chart_data.set_index('Team'))
 
-        for g in games:
-            if g["home_team"]["full_name"] == team_name:
-                pts += g["home_team_score"]
-                opp += g["visitor_team_score"]
-                count += 1
-            elif g["visitor_team"]["full_name"] == team_name:
-                pts += g["visitor_team_score"]
-                opp += g["home_team_score"]
-                count += 1
+# --- TAB 2: PROP PREDICTOR ---
+with tab2:
+    p_name = st.text_input("Player Name", "Stephen Curry")
+    p_line = st.number_input("1xBet Line", value=25.5)
+    if st.button("Analyze Prop"):
+        p_info = players.find_players_by_full_name(p_name)[0]
+        log = playergamelog.PlayerGameLog(player_id=p_info['id']).get_data_frames()[0]
+        last_10 = log.head(10)
+        hit_rate = (last_10['PTS'] > p_line).mean() * 100
+        
+        st.write(f"### Hit Rate: {hit_rate:.1f}%")
+        st.line_chart(last_10[['GAME_DATE', 'PTS']].set_index('GAME_DATE').sort_index())
 
-        if count == 0:
-            return {"ppg": 100, "oppg": 100}
-
-        return {
-            "ppg": pts / count,
-            "oppg": opp / count
-        }
-    except:
-        return {"ppg": 100, "oppg": 100}
-
-# -----------------------------
-# ML MODEL (SIMPLE TRAIN)
-# -----------------------------
-@st.cache_resource
-def train_model():
-    data = []
-    for _ in range(200):
-        home = random.uniform(90, 120)
-        away = random.uniform(90, 120)
-        diff = home - away
-        target = 1 if diff > 0 else 0
-        data.append([home, away, diff, target])
-
-    df = pd.DataFrame(data, columns=["home", "away", "diff", "target"])
-
-    X = df[["home", "away", "diff"]]
-    y = df["target"]
-
-    model = RandomForestClassifier()
-    model.fit(X, y)
-
-    return model
-
-model = train_model()
-
-# -----------------------------
-# ML PREDICTION
-# -----------------------------
-def predict_game(game):
-    try:
-        home = game["home_team"]
-        away = game["away_team"]
-
-        home_stats = compute_team_stats(home)
-        away_stats = compute_team_stats(away)
-
-        features = [[
-            home_stats["ppg"],
-            away_stats["ppg"],
-            home_stats["ppg"] - away_stats["ppg"]
-        ]]
-
-        prob = model.predict_proba(features)[0][1]
-
-        pick = home if prob > 0.5 else away
-
-        return {
-            "pick": pick,
-            "confidence": round(prob * 100, 2)
-        }
-
-    except:
-        return None
-
-# -----------------------------
-# PARLAY
-# -----------------------------
-def generate_parlay(games):
-    picks = []
-
-    for g in games:
-        pred = predict_game(g)
-        if pred:
-            picks.append(pred)
-
-    picks = sorted(picks, key=lambda x: x["confidence"], reverse=True)
-
-    return picks[:3]
-
-# -----------------------------
-# STAR PLAYER (SIMPLIFIED)
-# -----------------------------
-def get_star_player(team):
-    stars = {
-        "Lakers": "LeBron James",
-        "Warriors": "Stephen Curry",
-        "Celtics": "Jayson Tatum",
-        "Bucks": "Giannis Antetokounmpo"
-    }
-
-    name = stars.get(team, "Star Player")
-
-    return {
-        "Player": name,
-        "PTS Avg": round(random.uniform(20, 30), 1),
-        "Pick": "OVER",
-        "Confidence": "🔥 HIGH"
-    }
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("🔥 UNIVERSAL AI MASTER ORACLE")
-
-sport_label = st.selectbox("Select Sport", list(SPORT_MAP.keys()))
-sport_key = SPORT_MAP[sport_label]
-
-with st.spinner("Loading games..."):
-    games = fetch_odds(sport_key)
-
-if not games:
-    games = [{
-        "home_team": "Lakers",
-        "away_team": "Warriors",
-        "commence_time": "2026-04-28T02:00:00Z"
-    }]
-
-st.subheader("📊 Games")
-
-for g in games[:5]:
-    home = g["home_team"]
-    away = g["away_team"]
-
-    pred = predict_game(g)
-
-    time = datetime.fromisoformat(g["commence_time"].replace("Z", "")) + timedelta(hours=8)
-
-    st.markdown(f"""
-    ### {away} @ {home}
-    🕒 {time.strftime('%I:%M %p')}
-
-    🔥 PICK: {pred['pick'] if pred else 'N/A'}  
-    📊 CONFIDENCE: {pred['confidence'] if pred else '-'}%
-    """)
-
-    with st.expander(f"⭐ STAR PLAYER: {home}"):
-        star = get_star_player(home)
-        st.table([star])
-
-    st.divider()
-
-# -----------------------------
-# PARLAY
-# -----------------------------
-st.subheader("🔥 SMART PARLAY")
-
-parlay = generate_parlay(games)
-
-for p in parlay:
-    st.write(f"{p['pick']} ({p['confidence']}%)")
+# --- TAB 3: PLAYER STATS ---
+with tab3:
+    search_p = st.text_input("Search Player", "LeBron James")
+    if st.button("Fetch Stats"):
+        p_info = players.find_players_by_full_name(search_p)[0]
+        stats = playercareerstats.PlayerCareerStats(player_id=p_info['id']).get_data_frames()[0]
+        latest = stats.iloc[-1]
+        st.write(f"**Season PPG:** {latest['PTS']/latest['GP']:.1f}")
+        # CHART: Stat Breakdown
+        st.bar_chart(pd.DataFrame({'Stat': ['PTS', 'REB', 'AST'], 'Value': [latest['PTS']/latest['GP'], latest['REB']/latest['GP'], latest['AST']/latest['GP']]}).set_index('Stat'))
